@@ -31,6 +31,31 @@
             "reauth_successful": "Re-authentication was successful."
         }
     },
+    "options": {
+        "step": {
+            "init": {
+                "title": "E-mail verification code",
+                "description": "50five can ask for a verification code by e-mail at login. Fill in a mailbox that receives these mails, and the integration reads the code itself via IMAP. Leave the user empty to switch this off. Leave the app password empty to keep the saved one.",
+                "data": {
+                    "imap_username": "IMAP user (full e-mail address)",
+                    "imap_password": "App password",
+                    "imap_host": "IMAP server",
+                    "imap_port": "IMAP port",
+                    "imap_folder": "Folder or label",
+                    "imap_sender": "Sender of the code mails"
+                },
+                "data_description": {
+                    "imap_password": "For Gmail: an app password, not your normal password. It gives access to the whole mailbox.",
+                    "imap_folder": "For Gmail, a label set by a filter, for example 50five-codes."
+                }
+            }
+        },
+        "error": {
+            "imap_auth": "Could not log in to the mailbox. Check server, user and app password.",
+            "imap_folder": "This folder or label does not exist.",
+            "imap_password_required": "Fill in the app password."
+        }
+    },
     "selector": {
         "country": {
             "options": {

@@ -31,6 +31,31 @@
             "reauth_successful": "Opnieuw aanmelden gelukt."
         }
     },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Verificatiecode per e-mail",
+                "description": "50five kan bij het inloggen om een verificatiecode per e-mail vragen. Vul een mailbox in die deze mails ontvangt; de integratie haalt de code dan zelf op via IMAP. Laat de gebruiker leeg om dit uit te zetten. Laat het app-wachtwoord leeg om het opgeslagen wachtwoord te houden.",
+                "data": {
+                    "imap_username": "IMAP-gebruiker (volledig e-mailadres)",
+                    "imap_password": "App-wachtwoord",
+                    "imap_host": "IMAP-server",
+                    "imap_port": "IMAP-poort",
+                    "imap_folder": "Map of label",
+                    "imap_sender": "Afzender van de codemails"
+                },
+                "data_description": {
+                    "imap_password": "Voor Gmail: een app-wachtwoord, niet je gewone wachtwoord. Het geeft toegang tot de hele mailbox.",
+                    "imap_folder": "Voor Gmail een label dat een filter zet, bijvoorbeeld 50five-codes."
+                }
+            }
+        },
+        "error": {
+            "imap_auth": "Inloggen op de mailbox mislukt. Controleer server, gebruiker en app-wachtwoord.",
+            "imap_folder": "Deze map of dit label bestaat niet.",
+            "imap_password_required": "Vul het app-wachtwoord in."
+        }
+    },
     "selector": {
         "country": {
             "options": {

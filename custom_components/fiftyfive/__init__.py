@@ -7,6 +7,9 @@ https://github.com/Crazy-Duck/home-assistant-fiftyfive
 
 from __future__ import annotations
 
+import asyncio
+from functools import partial
+from time import monotonic
 from typing import TYPE_CHECKING
 
 from homeassistant.const import CONF_COUNTRY, CONF_PASSWORD, CONF_USERNAME, Platform
@@ -17,12 +20,41 @@ from homeassistant.loader import async_get_loaded_integration
 from fiftyfive import CustomerType
 
 from .api import FiftyfiveApiClient
-from .const import CONF_CUST_TYPE, DEFAULT_UPDATE_INTERVAL, DOMAIN, LOGGER
+from .const import (
+    CONF_CUST_TYPE,
+    CONF_IMAP_FOLDER,
+    CONF_IMAP_HOST,
+    CONF_IMAP_PASSWORD,
+    CONF_IMAP_PORT,
+    CONF_IMAP_SENDER,
+    CONF_IMAP_USERNAME,
+    DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
+    LOGGER,
+    OTP_POLL_INTERVAL,
+    OTP_POLL_TIMEOUT,
+)
 from .coordinator import FiftyfiveDataUpdateCoordinator
 from .data import FiftyfiveData
+from .imap_otp import (
+    DEFAULT_IMAP_FOLDER,
+    DEFAULT_IMAP_HOST,
+    DEFAULT_IMAP_PORT,
+    DEFAULT_IMAP_SENDER,
+    ImapOtpError,
+    ImapSettings,
+    find_code,
+)
+from .otp_api import LoginGuard, OtpApi, OtpMailboxError
 from .service_handler import ChargerServiceHandler
+from .session_store import FiftyfiveSessionStore
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from datetime import datetime
+    from typing import Any
+
+    from aiohttp import ClientSession
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers.typing import ConfigType
@@ -100,6 +132,7 @@ async def async_setup_entry(
             market=entry.data[CONF_COUNTRY],
             customer_type=entry.data[CONF_CUST_TYPE],
             session=session,
+            api=await _async_otp_api(hass, entry, session),
         ),
         integration=async_get_loaded_integration(hass, entry.domain),
         coordinator=coordinator,
@@ -108,9 +141,72 @@ async def async_setup_entry(
     await coordinator.async_config_entry_first_refresh()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+    # No update listener: the options flow reloads the entry itself (also when
+    # setup failed) and the reauth flow reloads after updating the password.
 
     return True
+
+
+def imap_settings(options: Mapping[str, Any]) -> ImapSettings | None:
+    """Return the mailbox settings, or None when no mailbox is configured."""
+    if not options.get(CONF_IMAP_USERNAME) or not options.get(CONF_IMAP_PASSWORD):
+        return None
+    return ImapSettings(
+        host=options.get(CONF_IMAP_HOST) or DEFAULT_IMAP_HOST,
+        port=int(options.get(CONF_IMAP_PORT) or DEFAULT_IMAP_PORT),
+        username=options[CONF_IMAP_USERNAME],
+        password=options[CONF_IMAP_PASSWORD],
+        folder=options.get(CONF_IMAP_FOLDER) or DEFAULT_IMAP_FOLDER,
+        sender=options.get(CONF_IMAP_SENDER) or DEFAULT_IMAP_SENDER,
+    )
+
+
+async def _async_otp_api(
+    hass: HomeAssistant, entry: FiftyfiveConfigEntry, session: ClientSession
+) -> OtpApi | None:
+    """Return an OtpApi when a mailbox is configured; None keeps v0.10.0 behaviour."""
+    settings = imap_settings(entry.options)
+    if settings is None:
+        return None
+
+    store = FiftyfiveSessionStore(hass, entry.entry_id)
+    await store.async_load()
+    guard = LoginGuard(
+        last_attempt=float(store.guard.get("last_attempt", 0)),
+        strikes=int(store.guard.get("strikes", 0)),
+    )
+    guard.on_change = lambda: store.set_guard(guard.as_dict())
+
+    api = OtpApi(
+        session=session,
+        email=entry.data[CONF_USERNAME],
+        password=entry.data[CONF_PASSWORD],
+        market=entry.data[CONF_COUNTRY],
+        customer_type=entry.data[CONF_CUST_TYPE],
+        code_provider=partial(_async_wait_for_code, hass, settings),
+        guard=guard,
+        on_login=store.set_cookies,
+    )
+    api.restore_cookies(store.cookies)
+    return api
+
+
+async def _async_wait_for_code(
+    hass: HomeAssistant, settings: ImapSettings, started: datetime
+) -> str | None:
+    """Poll the mailbox for the verification code of the login that started."""
+    LOGGER.info("50five asks for a verification code; checking the mailbox")
+    deadline = monotonic() + OTP_POLL_TIMEOUT
+    while True:
+        try:
+            found = await hass.async_add_executor_job(find_code, settings, started)
+        except ImapOtpError as exception:
+            raise OtpMailboxError(str(exception)) from exception
+        if found:
+            return found.code
+        if monotonic() >= deadline:
+            return None
+        await asyncio.sleep(OTP_POLL_INTERVAL)
 
 
 async def async_unload_entry(
@@ -127,3 +223,11 @@ async def async_reload_entry(
 ) -> None:
     """Reload config entry."""
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_entry(
+    hass: HomeAssistant,
+    entry: FiftyfiveConfigEntry,
+) -> None:
+    """Delete the saved session when the entry is removed."""
+    await FiftyfiveSessionStore(hass, entry.entry_id).async_remove()

@@ -22,8 +22,12 @@ from fiftyfive import (
     UnlockConnector,
 )
 
+from .otp_api import OtpAuthError, OtpLockedError, OtpLoginError
+
 if TYPE_CHECKING:
     from aiohttp import ClientSession
+
+    from fiftyfive import Request
 
 
 class FiftyfiveApiClientError(Exception):
@@ -51,16 +55,23 @@ class FiftyfiveApiInvalidCardError(
 class FiftyfiveApiClient:
     """Sample API Client."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         username: str,
         password: str,
         market: Market,
         customer_type: CustomerType,
         session: ClientSession,
+        *,
+        api: Api | None = None,
     ) -> None:
-        """Sample API Client."""
-        self._api = Api(
+        """
+        Sample API Client.
+
+        ``api`` replaces the library client, e.g. with an ``OtpApi`` when a
+        mailbox for the verification code is configured.
+        """
+        self._api = api or Api(
             session=session,
             email=username,
             password=password,
@@ -68,14 +79,23 @@ class FiftyfiveApiClient:
             customer_type=customer_type,
         )
 
+    async def _make_requests(self, requests: list[Request]) -> Any:
+        """Make requests; translate 2FA login errors into client errors."""
+        try:
+            return await self._api.make_requests(requests)
+        except (OtpAuthError, OtpLockedError) as exception:
+            raise FiftyfiveApiClientAuthenticationError(str(exception)) from exception
+        except OtpLoginError as exception:
+            raise FiftyfiveApiClientCommunicationError(str(exception)) from exception
+
     async def async_get_data(self) -> Any:
         """Get data from the API."""
-        networks = await self._api.make_requests([NetworkOverview()])
+        networks = await self._make_requests([NetworkOverview()])
         if not networks:
             msg = "Invalid credentials"
             raise FiftyfiveApiClientAuthenticationError(msg)
 
-        details = await self._api.make_requests(
+        details = await self._make_requests(
             [Overview(network["IDX"]) for network in networks[0]]
         )
 
@@ -83,11 +103,11 @@ class FiftyfiveApiClient:
 
     async def async_start(self, charger: str, card_id: str) -> Any:
         """Start charge session."""
-        clients = await self._api.make_requests(
+        clients = await self._make_requests(
             [ClientSearch(recharge_spot_id=charger, name="")]
         )
 
-        card_lists = await self._api.make_requests(
+        card_lists = await self._make_requests(
             [
                 CardSearch(recharge_spot_id=charger, customer_id=client["id"])
                 for client in clients[0]
@@ -96,7 +116,7 @@ class FiftyfiveApiClient:
 
         for i, card_list in enumerate(card_lists):
             if any(card["text"] == card_id for card in card_list):
-                return await self._api.make_requests(
+                return await self._make_requests(
                     [
                         Start(
                             channel=Channel(recharge_spot_id=charger, channel_id="1"),
@@ -109,36 +129,36 @@ class FiftyfiveApiClient:
 
     async def async_stop(self, charger: str) -> Any:
         """Stop a charge session."""
-        return await self._api.make_requests(
+        return await self._make_requests(
             [Stop(channel=Channel(recharge_spot_id=charger, channel_id="1"))]
         )
 
     async def async_soft_reset(self, charger: str) -> Any:
         """Soft reset a charger."""
-        return await self._api.make_requests(
+        return await self._make_requests(
             [SoftReset(channel=Channel(recharge_spot_id=charger, channel_id="1"))]
         )
 
     async def async_hard_reset(self, charger: str) -> Any:
         """Hard reset a charger."""
-        return await self._api.make_requests(
+        return await self._make_requests(
             [HardReset(channel=Channel(recharge_spot_id=charger, channel_id="1"))]
         )
 
     async def async_unlock_connector(self, charger: str) -> Any:
         """Unlock the connector from a charger."""
-        return await self._api.make_requests(
+        return await self._make_requests(
             [UnlockConnector(channel=Channel(recharge_spot_id=charger, channel_id="1"))]
         )
 
     async def async_block(self, charger: str) -> Any:
         """Block a charger."""
-        return await self._api.make_requests(
+        return await self._make_requests(
             [Block(channel=Channel(recharge_spot_id=charger, channel_id="1"))]
         )
 
     async def async_unblock(self, charger: str) -> Any:
         """Unblock a charger."""
-        return await self._api.make_requests(
+        return await self._make_requests(
             [Unblock(channel=Channel(recharge_spot_id=charger, channel_id="1"))]
         )

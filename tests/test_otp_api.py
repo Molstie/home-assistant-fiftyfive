@@ -38,6 +38,9 @@ TWO_FA_HTML = """
   <input type="submit" name="VerifyOtp" value="Verify">
 </form>
 """
+# The fake portal is a real local HTTP server.
+pytestmark = pytest.mark.usefixtures("socket_enabled")
+
 OVERVIEW = [[{"IDX": "1234727754", "NAME": "Laadpaal", "STATUS": "0"}]]
 
 
