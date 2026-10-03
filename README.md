@@ -1,5 +1,33 @@
 # Home Assistant 50five custom integration
 
+> **This is a modified version** of
+> [Crazy-Duck/home-assistant-fiftyfive](https://github.com/Crazy-Duck/home-assistant-fiftyfive)
+> (v0.10.0, commit `8597bbc`), licensed under the GPL-3.0 like the original.
+> It adds an automatic login for accounts where 50five requires an e-mail
+> verification code (2FA). Same domain `fiftyfive`, same devices and
+> entities: it can replace the original in place, and the original can be
+> reinstalled at any time.
+>
+> **What was changed**
+>
+> - Login with e-mail verification code: the integration reads the code from
+>   a mailbox via IMAP (`otp_api.py`, `imap_otp.py`). Only active when a
+>   mailbox is configured under *Configure* (options); without it the
+>   integration behaves as v0.10.0.
+> - At most one login per 15 minutes; after three failed logins in a row
+>   automatic logins stop and Home Assistant asks to re-authenticate.
+> - Session cookies are kept across restarts (`.storage/fiftyfive.<entry_id>`),
+>   so a code is needed about once a day (the portal session lasts 24 hours).
+> - Own HTTP session per config entry (as in upstream PR #87).
+> - The re-authentication flow no longer crashes on its first step.
+> - `tools/test_login.py` tests the real login outside Home Assistant.
+>
+> **Mailbox (Gmail):** create an app password, and a filter that gives the
+> code mails (from `noreply@lastmilesolutions.com`, subject *Uw
+> verificatiecode*) a label; use that label as the folder. The app password
+> gives access to the whole mailbox and is stored readable in
+> `.storage/core.config_entries`.
+
 This custom integration allows you to interact with your 50five managed EV
 charger. It allows starting/stopping charge session as well as exposes some
 data about the charger (on-going sessions, status, ...) as sensors.
