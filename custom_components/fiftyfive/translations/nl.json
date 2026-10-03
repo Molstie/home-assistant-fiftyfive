@@ -15,13 +15,20 @@
                 "data": {
                     "password": "Paswoord"
                 }
+            },
+            "reauth_confirm": {
+                "description": "Update je paswoord.",
+                "data": {
+                    "password": "Paswoord"
+                }
             }
         },
         "error": {
             "auth": "Ongeldige inloggegevens/markt."
         },
         "abort": {
-            "already_configured": "Deze combinatie is al configureerd."
+            "already_configured": "Deze combinatie is al configureerd.",
+            "reauth_successful": "Opnieuw aanmelden gelukt."
         }
     },
     "selector": {

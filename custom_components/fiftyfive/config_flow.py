@@ -104,24 +104,23 @@ class FiftyfiveFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         """Confirm reauthentication dialog."""
         _errors: dict[str, str] = {}
-        if not await self._test_credentials(
-            username=self.username,
-            password=user_input[CONF_PASSWORD],
-            market=self.country,
-            customer_type=self.customer_type,
-        ):
-            LOGGER.warning("Invalid credentials/market.")
-            _errors["base"] = "auth"
-        else:
-            await self.async_set_unique_id(unique_id=slugify(user_input[CONF_USERNAME]))
-            self._abort_if_unique_id_configured()
-            return self.async_create_entry(
-                title=user_input[CONF_USERNAME],
-                data=user_input,
-            )
+        if user_input is not None:
+            if not await self._test_credentials(
+                username=self.username,
+                password=user_input[CONF_PASSWORD],
+                market=self.country,
+                customer_type=self.customer_type,
+            ):
+                LOGGER.warning("Invalid credentials/market.")
+                _errors["base"] = "auth"
+            else:
+                return self.async_update_reload_and_abort(
+                    self._get_reauth_entry(),
+                    data_updates={CONF_PASSWORD: user_input[CONF_PASSWORD]},
+                )
 
         return self.async_show_form(
-            step_id="user",
+            step_id="reauth_confirm",
             data_schema=vol.Schema(
                 {
                     vol.Required(CONF_PASSWORD): selector.TextSelector(

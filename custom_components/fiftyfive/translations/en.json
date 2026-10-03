@@ -15,13 +15,20 @@
                 "data": {
                     "password": "Password"
                 }
+            },
+            "reauth_confirm": {
+                "description": "Update your password.",
+                "data": {
+                    "password": "Password"
+                }
             }
         },
         "error": {
             "auth": "Invalid credentials/market."
         },
         "abort": {
-            "already_configured": "This entry is already configured."
+            "already_configured": "This entry is already configured.",
+            "reauth_successful": "Re-authentication was successful."
         }
     },
     "selector": {
