@@ -5,13 +5,14 @@
 ``make_requests()``. It is only used when a mailbox has been configured; without
 one the integration keeps using the plain library ``Api``.
 
-The login flow:
+The login flow, as a browser does it:
 
-1. ``POST /Login/Login`` with e-mail and password (no redirects followed).
-2. Where the redirect points decides what happens next: back to the login page
-   means the credentials were rejected, a 2FA page means a code is needed.
-3. ``GET`` the 2FA page (this sends the mail) and read the hidden ``_token``.
-4. Wait for the code in the mailbox, then ``POST`` it to ``/2fa_check``.
+1. ``GET /Login/Login`` for the session and load balancer (SERVERID) cookies.
+2. ``POST /Login/Login`` with e-mail and password (no redirects followed).
+3. Follow the redirects one at a time. Back to the login page means the
+   credentials were rejected; reaching the 2FA page means a code is needed.
+4. Showing the 2FA page sends the mail; read the hidden ``_token`` from it.
+5. Wait for the code in the mailbox, then ``POST`` it to ``/2fa_check``.
 
 This module has no Home Assistant dependencies, so ``tools/test_login.py`` can
 use it outside Home Assistant. Never log the password or the code.
@@ -26,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from http import HTTPStatus
 from json import dumps
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +45,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__package__)
 
 HTTP_FOUND = 302
+MAX_REDIRECTS = 5
 SESSION_COOKIE = "PHPSESSID"
 
 # At most one login per 15 minutes, and stop after three failed logins in a
@@ -74,6 +77,10 @@ class OtpCodeTimeoutError(OtpAuthError):
 
 class OtpMailboxError(OtpLoginError):
     """The mailbox could not be read."""
+
+
+class OtpFlowError(OtpLoginError):
+    """The portal answered in an unexpected way during the login."""
 
 
 class OtpThrottledError(OtpLoginError):
@@ -256,62 +263,52 @@ class OtpApi(Api):
             self._on_login(cookie)
 
     async def _login_steps(self, started: datetime) -> None:
-        step, location = await self._password_step()
-        if step is LoginStep.REJECTED:
-            msg = "50five rejected the e-mail address or password"
-            raise OtpAuthError(msg)
-        if step is LoginStep.TWO_FACTOR:
-            await self._two_factor_step(location, started)
-
-    async def _password_step(self) -> tuple[LoginStep, str]:
         self.clear_session()
+        login_url = f"{self.url}/Login/Login"
+        # Open the login page first, like a browser does. That sets the session
+        # cookie and the load balancer cookie (SERVERID) the whole flow must
+        # stick to; without it later steps can land on another backend.
+        await self._hop("GET", login_url)
+
         data = {
             "emailField": self.email,
             "passwordField": self.password,
             "Login": "Log in",
         }
-        async with self.session.post(
-            f"{self.url}/Login/Login", data=data, allow_redirects=False
-        ) as response:
-            status = response.status
-            location = response.headers.get("Location", "")
-        self._log("POST /Login/Login", status, location)
-        if status != HTTP_FOUND:
-            return LoginStep.REJECTED, location
-
-        step = classify_location(location)
-        if step is not LoginStep.LOGGED_IN:
-            return step, location
-
-        # The redirect alone does not always tell; ask where the start page
-        # sends us now.
-        async with self.session.get(f"{self.url}/", allow_redirects=False) as response:
-            status = response.status
-            landing = response.headers.get("Location", "")
-        self._log("GET /", status, landing)
-        if status == HTTP_FOUND:
-            landing_step = classify_location(landing)
-            if landing_step is not LoginStep.LOGGED_IN:
-                return landing_step, landing
-        return LoginStep.LOGGED_IN, location
-
-    async def _two_factor_step(self, location: str, started: datetime) -> None:
-        page_url = (
-            str(URL(self.url).join(URL(location)))
-            if "2fa" in _path(location)
-            else f"{self.url}/2fa"
+        status, location, _ = await self._hop(
+            "POST", login_url, data=data, headers=self._form_headers(login_url)
         )
-        async with self.session.get(page_url) as response:
-            status = response.status
-            html = await response.text()
-            final = str(response.url)
+        if status != HTTP_FOUND:
+            msg = "50five rejected the e-mail address or password"
+            raise OtpAuthError(msg)
+
+        # Follow the redirects one by one, exactly where the portal sends us.
+        for _ in range(MAX_REDIRECTS):
+            step = classify_location(location)
+            if step is LoginStep.REJECTED:
+                msg = "50five rejected the e-mail address or password"
+                raise OtpAuthError(msg)
+            url = str(URL(self.url).join(URL(location)))
+            status, location, html = await self._hop("GET", url)
+            if step is LoginStep.TWO_FACTOR:
+                if status != HTTPStatus.OK:
+                    msg = (
+                        "50five did not show the verification page "
+                        f"(HTTP {status}); no verification mail was sent"
+                    )
+                    raise OtpFlowError(msg)
+                await self._submit_code(url, html, started)
+                return
+            if status != HTTP_FOUND:
+                return  # A normal page: logged in without 2FA.
+        msg = "Too many redirects after the 50five login"
+        raise OtpFlowError(msg)
+
+    async def _submit_code(self, page_url: str, html: str, started: datetime) -> None:
         token = find_token(html)
         inputs = sorted(set(_INPUT_NAME_RE.findall(html)))
-        self._log(
-            f"GET {URL(page_url).path}",
-            status,
-            final,
-            f"token={'yes' if token else 'no'} inputs={','.join(inputs)}",
+        self._trace_line(
+            f"  form: token={'yes' if token else 'no'} inputs={','.join(inputs)}"
         )
 
         code = await self._code_provider(started)
@@ -326,15 +323,29 @@ class OtpApi(Api):
         data = {"_auth_code": code, "VerifyOtp": "Verify"}
         if token:
             data["_token"] = token
-        async with self.session.post(
-            check_url, data=data, allow_redirects=False
-        ) as response:
-            status = response.status
-            target = response.headers.get("Location", "")
-        self._log(f"POST {URL(check_url).path}", status, target)
+        status, target, _ = await self._hop(
+            "POST", check_url, data=data, headers=self._form_headers(page_url)
+        )
         if status != HTTP_FOUND or classify_location(target) is not LoginStep.LOGGED_IN:
             msg = "50five rejected the verification code"
             raise OtpAuthError(msg)
+
+    def _form_headers(self, referer: str) -> dict[str, str]:
+        return {"Origin": self.url, "Referer": referer}
+
+    async def _hop(self, method: str, url: str, **kwargs: Any) -> tuple[int, str, str]:
+        """Do one request without following redirects; return status, Location, body."""
+        async with self.session.request(
+            method, url, allow_redirects=False, **kwargs
+        ) as response:
+            status = response.status
+            location = response.headers.get("Location", "")
+            body = await response.text() if status == HTTPStatus.OK else ""
+            cookies = ",".join(sorted(response.cookies)) or "-"
+        self._log(
+            f"{method} {URL(url).path}", status, location, f"set-cookie={cookies}"
+        )
+        return status, location, body
 
     # -- requests -----------------------------------------------------------
 
@@ -367,7 +378,9 @@ class OtpApi(Api):
     def _log(self, step: str, status: int, location: str, extra: str = "") -> None:
         """Log one HTTP step without query strings or secrets."""
         where = _path(location) if location.startswith(("http", "/")) else location
-        line = f"{step} -> {status} {where} {extra}".rstrip()
+        self._trace_line(f"{step} -> {status} {where} {extra}".rstrip())
+
+    def _trace_line(self, line: str) -> None:
         _LOGGER.debug(line)
         if self._trace:
             self._trace(line)

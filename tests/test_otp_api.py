@@ -19,6 +19,7 @@ from fiftyfive_fork.otp_api import (
     OtpApi,
     OtpAuthError,
     OtpCodeTimeoutError,
+    OtpFlowError,
     OtpLockedError,
     OtpThrottledError,
     classify_location,
@@ -42,66 +43,81 @@ OVERVIEW = [[{"IDX": "1234727754", "NAME": "Laadpaal", "STATUS": "0"}]]
 @dataclass
 class Portal:
     """
-    Fake 50five portal.
+    Fake 50five portal, modelled on what the real one did on 3 Oct 2026.
 
-    ``two_factor``: the password step redirects to /2fa (or via / when
-    ``via_start_page``). ``valid_sessions`` are the session ids the API accepts.
+    ``GET /Login/Login`` hands out PHPSESSID and the load balancer cookie
+    SERVERID. A request without SERVERID lands on "another backend" that does
+    not know the session. The password POST redirects to /Overview, which
+    redirects to /2fa while the code is still pending.
     """
 
     two_factor: bool = True
-    via_start_page: bool = False
     password_ok: bool = True
     valid_code: str = "654321"
     expired_answer: str = "empty"  # or "login_page"
     ajax_broken: bool = False
     valid_sessions: set[str] = field(default_factory=set)
+    pending: set[str] = field(default_factory=set)
     logins: int = 0
     code_posts: list[dict] = field(default_factory=list)
+    two_fa_pages_shown: int = 0
+    two_fa_page_bounces: bool = False
     _counter: int = 0
 
-    def _new_session(self) -> str:
+    def _session(self, request: web.Request) -> str | None:
+        if request.cookies.get("SERVERID") != "b1":
+            return None
+        return request.cookies.get("PHPSESSID")
+
+    async def login_page(self, _: web.Request) -> web.Response:
+        """GET /Login/Login."""
         self._counter += 1
-        return f"sess{self._counter}"
+        response = web.Response(text="<html>login</html>", content_type="text/html")
+        response.set_cookie("PHPSESSID", f"sess{self._counter}")
+        response.set_cookie("SERVERID", "b1")
+        return response
 
     async def login(self, request: web.Request) -> web.Response:
         """POST /Login/Login."""
         self.logins += 1
         form = await request.post()
         assert form["Login"] == "Log in"
-        sid = self._new_session()
-        if not self.password_ok:
-            target = "/Login/Login"
-        elif self.two_factor and not self.via_start_page:
-            target = "/2fa"
-        else:
-            target = "/"
-            if not self.two_factor:
-                self.valid_sessions.add(sid)
-        response = web.HTTPFound(target)
-        response.set_cookie("PHPSESSID", sid)
-        raise response
+        assert request.headers["Referer"].endswith("/Login/Login")
+        sid = self._session(request)
+        if not self.password_ok or sid is None:
+            raise web.HTTPFound(location="/Login/Login")
+        (self.pending if self.two_factor else self.valid_sessions).add(sid)
+        raise web.HTTPFound(location="/Overview")
 
-    async def start(self, request: web.Request) -> web.Response:
-        """GET /."""
-        sid = request.cookies.get("PHPSESSID", "")
+    async def overview(self, request: web.Request) -> web.Response:
+        """GET /Overview."""
+        sid = self._session(request)
         if sid in self.valid_sessions:
-            raise web.HTTPFound(location="/Overview")
-        raise web.HTTPFound(location="/2fa" if self.two_factor else "/Login/Login")
+            return web.Response(text="<html>overview</html>", content_type="text/html")
+        if sid in self.pending:
+            raise web.HTTPFound(location="/2fa")
+        raise web.HTTPFound(location="/Login/Login")
 
-    async def two_fa_page(self, _: web.Request) -> web.Response:
-        """GET /2fa."""
+    async def two_fa_page(self, request: web.Request) -> web.Response:
+        """GET /2fa: showing it sends the mail."""
+        if self.two_fa_page_bounces or self._session(request) not in self.pending:
+            raise web.HTTPFound(location="/Login/Login")
+        self.two_fa_pages_shown += 1
         return web.Response(text=TWO_FA_HTML, content_type="text/html")
 
     async def two_fa_check(self, request: web.Request) -> web.Response:
         """POST /2fa_check."""
         form = dict(await request.post())
         self.code_posts.append(form)
+        sid = self._session(request)
         if (
-            form.get("_auth_code") != self.valid_code
+            sid not in self.pending
+            or form.get("_auth_code") != self.valid_code
             or form.get("_token") != "csrf-abc"
         ):
             raise web.HTTPFound(location="/2fa")
-        self.valid_sessions.add(request.cookies["PHPSESSID"])
+        self.pending.discard(sid)
+        self.valid_sessions.add(sid)
         raise web.HTTPFound(location="/")
 
     async def ajax(self, request: web.Request) -> web.Response:
@@ -112,10 +128,6 @@ class Portal:
         if self.expired_answer == "login_page":
             raise web.HTTPFound(location="/Login/Login")
         return web.json_response([], content_type="text/html")
-
-    async def login_page(self, _: web.Request) -> web.Response:
-        """GET /Login/Login."""
-        return web.Response(text="<html>login</html>", content_type="text/html")
 
 
 class Codes:
@@ -144,7 +156,7 @@ async def base_url(portal: Portal) -> AsyncIterator[str]:
     app = web.Application()
     app.router.add_post("/Login/Login", portal.login)
     app.router.add_get("/Login/Login", portal.login_page)
-    app.router.add_get("/", portal.start)
+    app.router.add_get("/Overview", portal.overview)
     app.router.add_get("/2fa", portal.two_fa_page)
     app.router.add_post("/2fa_check", portal.two_fa_check)
     app.router.add_get("/api/ajax", portal.ajax)
@@ -230,17 +242,31 @@ async def test_login_with_2fa(
     assert api.guard.strikes == 0
 
 
-async def test_2fa_detected_via_start_page(
+async def test_2fa_page_falls_back_to_login(
     session: aiohttp.ClientSession, base_url: str, portal: Portal
 ) -> None:
-    """A login redirect to / that then lands on /2fa still triggers 2FA."""
-    portal.via_start_page = True
+    """If /2fa bounces to the login page: stop, no code is asked or sent."""
+    portal.two_fa_page_bounces = True
     codes = Codes("654321")
     api = make_api(session, base_url, codes)
 
+    with pytest.raises(OtpFlowError):
+        await api.login()
+
+    assert codes.calls == []
+    assert portal.code_posts == []
+    assert api.guard.strikes == 1
+
+
+async def test_cookies_stick_through_the_whole_flow(
+    session: aiohttp.ClientSession, base_url: str, portal: Portal
+) -> None:
+    """Session and SERVERID cookies from the login page are used throughout."""
+    api = make_api(session, base_url, Codes("654321"))
+
     await api.login()
 
-    assert len(codes.calls) == 1
+    assert portal.two_fa_pages_shown == 1
     assert api.session_cookie() in portal.valid_sessions
 
 
