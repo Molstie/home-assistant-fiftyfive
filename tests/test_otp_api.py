@@ -62,7 +62,12 @@ class Portal:
     code_posts: list[dict] = field(default_factory=list)
     two_fa_pages_shown: int = 0
     two_fa_page_bounces: bool = False
+    redirect_base: str = ""  # set to the server's own absolute URL
     _counter: int = 0
+
+    def _to(self, path: str) -> str:
+        """Redirect target: absolute http:// on the real host, like the portal."""
+        return f"{self.redirect_base}{path}"
 
     def _session(self, request: web.Request) -> str | None:
         if request.cookies.get("SERVERID") != "b1":
@@ -85,9 +90,9 @@ class Portal:
         assert request.headers["Referer"].endswith("/Login/Login")
         sid = self._session(request)
         if not self.password_ok or sid is None:
-            raise web.HTTPFound(location="/Login/Login")
+            raise web.HTTPFound(location=self._to("/Login/Login"))
         (self.pending if self.two_factor else self.valid_sessions).add(sid)
-        raise web.HTTPFound(location="/Overview")
+        raise web.HTTPFound(location=self._to("/Overview"))
 
     async def overview(self, request: web.Request) -> web.Response:
         """GET /Overview."""
@@ -95,13 +100,13 @@ class Portal:
         if sid in self.valid_sessions:
             return web.Response(text="<html>overview</html>", content_type="text/html")
         if sid in self.pending:
-            raise web.HTTPFound(location="/2fa")
-        raise web.HTTPFound(location="/Login/Login")
+            raise web.HTTPFound(location=self._to("/2fa"))
+        raise web.HTTPFound(location=self._to("/Login/Login"))
 
     async def two_fa_page(self, request: web.Request) -> web.Response:
         """GET /2fa: showing it sends the mail."""
         if self.two_fa_page_bounces or self._session(request) not in self.pending:
-            raise web.HTTPFound(location="/Login/Login")
+            raise web.HTTPFound(location=self._to("/Login/Login"))
         self.two_fa_pages_shown += 1
         return web.Response(text=TWO_FA_HTML, content_type="text/html")
 
@@ -115,10 +120,10 @@ class Portal:
             or form.get("_auth_code") != self.valid_code
             or form.get("_token") != "csrf-abc"
         ):
-            raise web.HTTPFound(location="/2fa")
+            raise web.HTTPFound(location=self._to("/2fa"))
         self.pending.discard(sid)
         self.valid_sessions.add(sid)
-        raise web.HTTPFound(location="/")
+        raise web.HTTPFound(location=self._to("/"))
 
     async def ajax(self, request: web.Request) -> web.Response:
         """GET /api/ajax."""
@@ -126,7 +131,7 @@ class Portal:
         if sid in self.valid_sessions and not self.ajax_broken:
             return web.json_response(OVERVIEW, content_type="text/html")
         if self.expired_answer == "login_page":
-            raise web.HTTPFound(location="/Login/Login")
+            raise web.HTTPFound(location=self._to("/Login/Login"))
         return web.json_response([], content_type="text/html")
 
 
@@ -161,7 +166,9 @@ async def base_url(portal: Portal) -> AsyncIterator[str]:
     app.router.add_post("/2fa_check", portal.two_fa_check)
     app.router.add_get("/api/ajax", portal.ajax)
     async with TestServer(app) as server:
-        yield str(server.make_url("")).rstrip("/")
+        url = str(server.make_url("")).rstrip("/")
+        portal.redirect_base = portal.redirect_base or url
+        yield url
 
 
 @pytest.fixture
@@ -203,6 +210,22 @@ def test_classify_location() -> None:
     assert classify_location("/Login/Login") is LoginStep.REJECTED
     assert classify_location("/") is LoginStep.LOGGED_IN
     assert classify_location("/Overview") is LoginStep.LOGGED_IN
+
+
+async def test_http_redirect_stays_on_https(session: aiohttp.ClientSession) -> None:
+    """The portal redirects to http://; follow on https, path only (3 Oct 2026)."""
+    api = make_api(session, "https://50five-snl.evc-net.com", Codes())
+
+    assert (
+        api._same_origin("http://50five-snl.evc-net.com/Overview")  # noqa: SLF001
+        == "https://50five-snl.evc-net.com/Overview"
+    )
+    assert (
+        api._same_origin("/2fa?x=1")  # noqa: SLF001
+        == "https://50five-snl.evc-net.com/2fa?x=1"
+    )
+    with pytest.raises(OtpFlowError):
+        api._same_origin("https://evil.example.com/2fa")  # noqa: SLF001
 
 
 def test_find_token() -> None:
@@ -268,6 +291,20 @@ async def test_cookies_stick_through_the_whole_flow(
 
     assert portal.two_fa_pages_shown == 1
     assert api.session_cookie() in portal.valid_sessions
+
+
+async def test_redirect_to_other_host_is_refused(
+    session: aiohttp.ClientSession, base_url: str, portal: Portal
+) -> None:
+    """A redirect to another host is never followed."""
+    codes = Codes("654321")
+    api = make_api(session, base_url, codes)
+    portal.redirect_base = "https://evil.example.com"
+
+    with pytest.raises(OtpFlowError):
+        await api.login()
+
+    assert codes.calls == []
 
 
 async def test_password_rejected(

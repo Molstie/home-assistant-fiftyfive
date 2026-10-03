@@ -278,7 +278,7 @@ class OtpApi(Api):
         status, location, _ = await self._hop(
             "POST", login_url, data=data, headers=self._form_headers(login_url)
         )
-        if status != HTTP_FOUND:
+        if status != HTTP_FOUND or classify_location(location) is LoginStep.REJECTED:
             msg = "50five rejected the e-mail address or password"
             raise OtpAuthError(msg)
 
@@ -286,9 +286,9 @@ class OtpApi(Api):
         for _ in range(MAX_REDIRECTS):
             step = classify_location(location)
             if step is LoginStep.REJECTED:
-                msg = "50five rejected the e-mail address or password"
-                raise OtpAuthError(msg)
-            url = str(URL(self.url).join(URL(location)))
+                msg = "50five dropped the session after the password was accepted"
+                raise OtpFlowError(msg)
+            url = self._same_origin(location)
             status, location, html = await self._hop("GET", url)
             if step is LoginStep.TWO_FACTOR:
                 if status != HTTPStatus.OK:
@@ -317,9 +317,7 @@ class OtpApi(Api):
             raise OtpCodeTimeoutError(msg)
 
         action = _FORM_ACTION_RE.search(html)
-        check_url = str(
-            URL(self.url).join(URL(action.group(1) if action else "/2fa_check"))
-        )
+        check_url = self._same_origin(action.group(1) if action else "/2fa_check")
         data = {"_auth_code": code, "VerifyOtp": "Verify"}
         if token:
             data["_token"] = token
@@ -329,6 +327,20 @@ class OtpApi(Api):
         if status != HTTP_FOUND or classify_location(target) is not LoginStep.LOGGED_IN:
             msg = "50five rejected the verification code"
             raise OtpAuthError(msg)
+
+    def _same_origin(self, target: str) -> str:
+        """
+        Turn a redirect target or form action into a URL on the portal itself.
+
+        The portal redirects to absolute ``http://`` URLs. Following those
+        literally drops the session cookie (it is ``secure``), so only the
+        path and query are used, always on the https base URL.
+        """
+        url = URL(target)
+        if url.is_absolute() and url.host != URL(self.url).host:
+            msg = f"Unexpected redirect to another host ({url.host})"
+            raise OtpFlowError(msg)
+        return str(URL(self.url).join(URL(url.path_qs)))
 
     def _form_headers(self, referer: str) -> dict[str, str]:
         return {"Origin": self.url, "Referer": referer}
@@ -365,9 +377,14 @@ class OtpApi(Api):
     async def _request(self, requests: list[Request]) -> Any:
         """Return the decoded answer, or ``None`` when the session is not valid."""
         params = {"requests": dumps(dict(enumerate([r.request for r in requests])))}
-        async with self.session.get(self.api, params=params) as response:
-            if "/login" in response.url.path.lower():
-                self._log("GET /api/ajax", response.status, str(response.url))
+        # No redirects: an expired session is redirected to the (http://)
+        # login page, which only tells us to log in again.
+        async with self.session.get(
+            self.api, params=params, allow_redirects=False
+        ) as response:
+            if response.status != HTTPStatus.OK:
+                location = response.headers.get("Location", "")
+                self._log("GET /api/ajax", response.status, location)
                 return None
             try:
                 return await response.json(content_type=None)
