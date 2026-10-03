@@ -36,6 +36,10 @@ class ImapOtpError(Exception):
     """Raised when the mailbox cannot be read (login, folder, network)."""
 
 
+class ImapFolderError(ImapOtpError):
+    """Raised when the configured folder does not exist."""
+
+
 @dataclass(frozen=True)
 class ImapSettings:
     """Connection settings for the mailbox that receives the codes."""
@@ -89,6 +93,22 @@ def extract_code(msg: email.message.Message) -> str | None:
     return match.group(1) if match else None
 
 
+def check_mailbox(settings: ImapSettings) -> None:
+    """Log in and open the folder; raise ImapOtpError when that fails."""
+    try:
+        with imaplib.IMAP4_SSL(
+            settings.host, settings.port, timeout=IMAP_TIMEOUT
+        ) as imap:
+            imap.login(settings.username, settings.password)
+            status, _ = imap.select(_quote_folder(settings.folder), readonly=True)
+    except (imaplib.IMAP4.error, OSError) as exception:
+        msg = f"IMAP error: {type(exception).__name__}"
+        raise ImapOtpError(msg) from exception
+    if status != "OK":
+        msg = f"Cannot open IMAP folder {settings.folder!r}"
+        raise ImapFolderError(msg)
+
+
 def find_code(
     settings: ImapSettings,
     not_before: datetime,
@@ -111,7 +131,7 @@ def find_code(
             status, _ = imap.select(_quote_folder(settings.folder))
             if status != "OK":
                 msg = f"Cannot open IMAP folder {settings.folder!r}"
-                raise ImapOtpError(msg)
+                raise ImapFolderError(msg)
 
             # SINCE only has day granularity; the exact check is done below.
             since = (threshold - timedelta(days=1)).strftime("%d-%b-%Y")

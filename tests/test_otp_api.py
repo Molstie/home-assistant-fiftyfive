@@ -18,6 +18,7 @@ from fiftyfive_fork.otp_api import (
     LoginStep,
     OtpApi,
     OtpAuthError,
+    OtpCodeError,
     OtpCodeTimeoutError,
     OtpFlowError,
     OtpLockedError,
@@ -185,13 +186,13 @@ def make_api(
     base_url: str,
     codes: Codes,
     guard: LoginGuard | None = None,
-    logins: list[str] | None = None,
+    logins: list[dict[str, str]] | None = None,
 ) -> OtpApi:
     """Build an OtpApi pointed at the fake portal."""
     api = OtpApi(
         session=session,
         email="user@example.com",
-        password="secret",  # noqa: S106
+        password="secret",
         market=Market.NL,
         customer_type=CustomerType.FORMER_SHELL,
         code_provider=codes,
@@ -253,7 +254,7 @@ async def test_login_with_2fa(
 ) -> None:
     """2FA: token and code are posted once; the new session is reported."""
     codes = Codes("654321")
-    logins: list[str] = []
+    logins: list[dict[str, str]] = []
     api = make_api(session, base_url, codes, logins=logins)
 
     assert await api.make_requests([NetworkOverview()]) == OVERVIEW
@@ -261,7 +262,7 @@ async def test_login_with_2fa(
     assert portal.code_posts == [
         {"_auth_code": "654321", "VerifyOtp": "Verify", "_token": "csrf-abc"}
     ]
-    assert logins == ["sess1"]
+    assert logins == [{"PHPSESSID": "sess1", "SERVERID": "b1"}]
     assert api.guard.strikes == 0
 
 
@@ -328,7 +329,7 @@ async def test_wrong_or_old_code(
     """A rejected code is a strike; it is submitted exactly once."""
     api = make_api(session, base_url, Codes("000000"))
 
-    with pytest.raises(OtpAuthError):
+    with pytest.raises(OtpCodeError):
         await api.login()
 
     assert len(portal.code_posts) == 1
@@ -409,7 +410,7 @@ async def test_saved_cookie_is_used_without_login(
     """With a valid saved session no login happens."""
     portal.valid_sessions.add("saved")
     api = make_api(session, base_url, Codes())
-    api.restore_session_cookie("saved")
+    api.restore_cookies({"PHPSESSID": "saved", "SERVERID": "b1"})
 
     assert await api.make_requests([NetworkOverview()]) == OVERVIEW
     assert portal.logins == 0
@@ -422,7 +423,7 @@ async def test_expired_session_logs_in_once_and_retries(
     """An empty answer or the login page means expired: log in once, retry once."""
     portal.expired_answer = expired_answer
     api = make_api(session, base_url, Codes("654321"))
-    api.restore_session_cookie("stale")
+    api.restore_cookies({"PHPSESSID": "stale"})
 
     assert await api.make_requests([NetworkOverview()]) == OVERVIEW
     assert portal.logins == 1
@@ -435,7 +436,7 @@ async def test_still_empty_after_relogin_returns_empty(
     portal.two_factor = False
     portal.ajax_broken = True
     api = make_api(session, base_url, Codes())
-    api.restore_session_cookie("stale")
+    api.restore_cookies({"PHPSESSID": "stale"})
 
     assert await api.make_requests([NetworkOverview()]) == []
     assert portal.logins == 1

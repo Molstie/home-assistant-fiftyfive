@@ -29,4 +29,5 @@ max-complexity = 25
 "tests/**" = [
     "S101", # asserts are how pytest works
     "INP001", # tests are not a package
+    "S105", "S106", # fake passwords in test data
 ]

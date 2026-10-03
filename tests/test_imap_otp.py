@@ -9,13 +9,19 @@ from typing import ClassVar, Self
 
 import pytest
 from fiftyfive_fork import imap_otp
-from fiftyfive_fork.imap_otp import ImapOtpError, ImapSettings, find_code
+from fiftyfive_fork.imap_otp import (
+    ImapFolderError,
+    ImapOtpError,
+    ImapSettings,
+    check_mailbox,
+    find_code,
+)
 
 SETTINGS = ImapSettings(
     host="imap.example.com",
     port=993,
     username="me@example.com",
-    password="app-password",  # noqa: S106
+    password="app-password",
     folder="50five-codes",
 )
 NOW = datetime(2026, 10, 3, 16, 51, 23, tzinfo=UTC)
@@ -70,7 +76,7 @@ class FakeImap:
             raise imaplib.IMAP4.error(msg)
         assert (user, password) == (SETTINGS.username, SETTINGS.password)
 
-    def select(self, folder: str) -> tuple[str, list]:
+    def select(self, folder: str, *, readonly: bool = False) -> tuple[str, list]:  # noqa: ARG002
         """Select a folder."""
         self.selected = folder
         return ("OK", [b"1"]) if folder == '"50five-codes"' else ("NO", [b"no"])
@@ -182,3 +188,15 @@ def test_missing_folder_raises() -> None:
 
     with pytest.raises(ImapOtpError):
         find_code(settings, NOW)
+
+
+def test_check_mailbox() -> None:
+    """The settings check logs in, opens the folder and reads nothing."""
+    check_mailbox(SETTINGS)
+
+    with pytest.raises(ImapFolderError):
+        check_mailbox(ImapSettings(**{**SETTINGS.__dict__, "folder": "bestaat-niet"}))
+
+    FakeImap.fail_login = True
+    with pytest.raises(ImapOtpError):
+        check_mailbox(SETTINGS)

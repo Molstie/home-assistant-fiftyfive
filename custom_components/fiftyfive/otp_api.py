@@ -68,10 +68,14 @@ class OtpLoginError(Exception):
 
 
 class OtpAuthError(OtpLoginError):
-    """The portal rejected the password or the verification code."""
+    """The portal rejected the e-mail address or password."""
 
 
-class OtpCodeTimeoutError(OtpAuthError):
+class OtpCodeError(OtpLoginError):
+    """The portal rejected the verification code."""
+
+
+class OtpCodeTimeoutError(OtpCodeError):
     """No verification code arrived in the mailbox in time."""
 
 
@@ -187,7 +191,7 @@ class OtpApi(Api):
         *,
         code_provider: Callable[[datetime], Awaitable[str | None]],
         guard: LoginGuard,
-        on_login: Callable[[str], None] | None = None,
+        on_login: Callable[[dict[str, str]], None] | None = None,
         trace: Callable[[str], None] | None = None,
     ) -> None:
         """
@@ -195,7 +199,8 @@ class OtpApi(Api):
 
         ``code_provider`` gets the moment the login started and returns the
         code from the mailbox, or ``None`` when none arrived in time.
-        ``on_login`` gets the new session cookie after a successful login.
+        ``on_login`` gets the portal cookies after a successful login, so they
+        can be saved and restored with ``restore_cookies`` after a restart.
         ``trace`` gets one line per HTTP step (no secrets), for diagnostics.
         """
         super().__init__(
@@ -221,11 +226,19 @@ class OtpApi(Api):
         )
         return cookie.value if cookie else None
 
-    def restore_session_cookie(self, value: str) -> None:
-        """Put a previously saved session cookie back into the jar."""
-        self.session.cookie_jar.update_cookies(
-            {SESSION_COOKIE: value}, response_url=URL(self.url)
-        )
+    def portal_cookies(self) -> dict[str, str]:
+        """Return all portal cookies (session and load balancer)."""
+        return {
+            name: morsel.value
+            for name, morsel in self.session.cookie_jar.filter_cookies(
+                URL(self.url)
+            ).items()
+        }
+
+    def restore_cookies(self, cookies: dict[str, str]) -> None:
+        """Put previously saved portal cookies back into the jar."""
+        if cookies:
+            self.session.cookie_jar.update_cookies(cookies, response_url=URL(self.url))
 
     def clear_session(self) -> None:
         """Forget all portal cookies."""
@@ -258,9 +271,8 @@ class OtpApi(Api):
             raise
 
         self.guard.record_success()
-        cookie = self.session_cookie()
-        if cookie and self._on_login:
-            self._on_login(cookie)
+        if self._on_login and self.session_cookie():
+            self._on_login(self.portal_cookies())
 
     async def _login_steps(self, started: datetime) -> None:
         self.clear_session()
@@ -326,7 +338,7 @@ class OtpApi(Api):
         )
         if status != HTTP_FOUND or classify_location(target) is not LoginStep.LOGGED_IN:
             msg = "50five rejected the verification code"
-            raise OtpAuthError(msg)
+            raise OtpCodeError(msg)
 
     def _same_origin(self, target: str) -> str:
         """
