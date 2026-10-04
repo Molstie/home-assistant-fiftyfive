@@ -20,6 +20,9 @@
 >   so a code is needed about once a day (the portal session lasts 24 hours).
 > - Own HTTP session per config entry (as in upstream PR #87).
 > - The re-authentication flow no longer crashes on its first step.
+> - Concurrent callers (coordinator, services, buttons) share one login and
+>   never clear each other's session; a command that answers empty is not
+>   taken for an expired session (0.10.0-otp.2).
 > - `tools/test_login.py` tests the real login outside Home Assistant.
 >
 > **Mailbox (Gmail):** create an app password, and a filter that gives the

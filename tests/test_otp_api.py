@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from json import loads
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from fiftyfive import CustomerType, Market, NetworkOverview
+from fiftyfive import Channel, CustomerType, Market, NetworkOverview, Stop
 from fiftyfive_fork.otp_api import (
     MAX_STRIKES,
     MIN_LOGIN_INTERVAL,
@@ -67,6 +69,11 @@ class Portal:
     two_fa_pages_shown: int = 0
     two_fa_page_bounces: bool = False
     redirect_base: str = ""  # set to the server's own absolute URL
+    # Answer to an action (start/stop/block/unblock) on a valid session. What
+    # the real portal sends is not known; it may well be falsy.
+    action_answer: Any = field(default_factory=lambda: [{"result": "ok"}])
+    ajax_calls: list[tuple[str | None, list[str]]] = field(default_factory=list)
+    ajax_gates: dict[str, asyncio.Event] = field(default_factory=dict)
     _counter: int = 0
 
     def _to(self, path: str) -> str:
@@ -132,7 +139,15 @@ class Portal:
     async def ajax(self, request: web.Request) -> web.Response:
         """GET /api/ajax."""
         sid = request.cookies.get("PHPSESSID")
+        methods = [r["method"] for r in loads(request.query["requests"]).values()]
+        self.ajax_calls.append((sid, methods))
+        if sid is not None and sid in self.ajax_gates:
+            # Hold this answer back until the test releases it: a request that
+            # is still in flight while another caller logs in.
+            await self.ajax_gates.pop(sid).wait()
         if sid in self.valid_sessions and not self.ajax_broken:
+            if "action" in methods:
+                return web.json_response(self.action_answer, content_type="text/html")
             return web.json_response(OVERVIEW, content_type="text/html")
         if self.expired_answer == "login_page":
             raise web.HTTPFound(location=self._to("/Login/Login"))
@@ -151,6 +166,22 @@ class Codes:
         """Return the next code."""
         self.calls.append(started)
         return self.codes.pop(0) if self.codes else None
+
+
+class SlowCodes(Codes):
+    """Mailbox that only hands out a code when the test says so."""
+
+    def __init__(self, *codes: str | None) -> None:
+        """Initialize."""
+        super().__init__(*codes)
+        self.waiting = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, started: datetime) -> str | None:
+        """Signal that the login waits for the mail, then wait for the test."""
+        self.waiting.set()
+        await self.release.wait()
+        return await super().__call__(started)
 
 
 @pytest.fixture
@@ -442,4 +473,143 @@ async def test_still_empty_after_relogin_returns_empty(
     api.restore_cookies({"PHPSESSID": "stale"})
 
     assert await api.make_requests([NetworkOverview()]) == []
+    assert portal.logins == 1
+
+
+# -- concurrent callers (4 Oct 2026) ------------------------------------------
+#
+# Home Assistant calls the client from several places at once: the coordinator
+# (every 5 s while the charger reports a session) and the services and buttons
+# (start, stop, block, unblock). On 4 Oct the live integration showed three
+# patterns, all with the automatic OTP login:
+#
+#   12:05:12  button: "50five rejected the verification code", and on the same
+#             millisecond the coordinator: "Next 50five login allowed in 888 s"
+#   12:20 and 13:23  a login succeeds (code mail sent), and 16 s later the next
+#             call needs a new login: "Next 50five login allowed in 884 s";
+#             two minutes later the coordinator fails the same way
+#
+# The tests below reproduce each pattern against the fake portal.
+
+STOP = Stop(channel=Channel(recharge_spot_id="1234727754", channel_id="1"))
+
+
+async def test_waiter_gets_the_outcome_of_the_running_login(
+    session: aiohttp.ClientSession, base_url: str, portal: Portal
+) -> None:
+    """
+    Gap 1: a caller that waits for a running login shares its outcome.
+
+    Before the fix the waiter got the lock after the failed login and tried
+    itself, which the guard blocked: OtpThrottledError instead of the real
+    cause (12:05:12, coordinator next to the button).
+    """
+    codes = SlowCodes("000000")  # 50five rejects this code
+    api = make_api(session, base_url, codes)
+
+    first = asyncio.create_task(api.login())
+    await codes.waiting.wait()
+    second = asyncio.create_task(api.login())
+    await asyncio.sleep(0)
+    codes.release.set()
+
+    results = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert [type(r) for r in results] == [OtpCodeError, OtpCodeError]
+    assert portal.logins == 1
+    assert len(portal.code_posts) == 1
+    assert api.guard.strikes == 1
+
+
+async def test_request_during_login_does_not_break_it(
+    session: aiohttp.ClientSession, base_url: str, portal: Portal
+) -> None:
+    """
+    Gap 2a: a request while a login waits for the code leaves that login alone.
+
+    The login has already set a fresh PHPSESSID that is not verified yet. A
+    second caller saw that cookie, got the "expired" answer and cleared the
+    jar outside the lock; the code was then posted without a session and
+    50five rejected it (12:05 and 12:35). The second caller then hit the
+    guard.
+    """
+    codes = SlowCodes("654321")
+    api = make_api(session, base_url, codes)
+
+    button = asyncio.create_task(api.make_requests([STOP]))
+    await codes.waiting.wait()
+    coordinator = asyncio.create_task(api.make_requests([NetworkOverview()]))
+    # Let the coordinator's request go out and come back while the login
+    # still waits for the mail.
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if len(portal.ajax_calls) >= 1:
+            break
+    codes.release.set()
+
+    assert await button == [{"result": "ok"}]
+    assert await coordinator == OVERVIEW
+    assert portal.logins == 1
+    assert len(portal.code_posts) == 1
+    assert api.guard.strikes == 0
+    assert api.session_cookie() in portal.valid_sessions
+
+
+async def test_late_expired_answer_does_not_wipe_the_new_session(
+    session: aiohttp.ClientSession, base_url: str, portal: Portal
+) -> None:
+    """
+    Gap 2b: an "expired" answer for an old cookie must not clear a newer one.
+
+    The coordinator's request left with the old cookie; meanwhile a service
+    call logged in. When the old answer came back the coordinator cleared the
+    jar, so the next call had no cookie, needed a login and hit the guard -
+    16 s after a successful login (12:20, 13:23), and the coordinator itself
+    failed too.
+    """
+    api = make_api(session, base_url, Codes("654321"))
+    api.restore_cookies({"PHPSESSID": "stale", "SERVERID": "b1"})
+    gate = asyncio.Event()
+    portal.ajax_gates["stale"] = gate
+
+    coordinator = asyncio.create_task(api.make_requests([NetworkOverview()]))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if portal.ajax_calls:
+            break
+    # The service call: its own request with the old cookie is answered
+    # "expired" at once, it logs in and its retry succeeds.
+    assert await api.make_requests([STOP]) == [{"result": "ok"}]
+    fresh = api.session_cookie()
+    assert fresh in portal.valid_sessions
+
+    gate.set()  # now the coordinator's old answer arrives
+    assert await coordinator == OVERVIEW
+    assert api.session_cookie() == fresh
+
+    # The next command goes straight through on the same session.
+    assert await api.make_requests([STOP]) == [{"result": "ok"}]
+    assert portal.logins == 1
+    assert api.guard.strikes == 0
+
+
+@pytest.mark.parametrize("answer", [[], None, False, {}])
+async def test_empty_answer_to_a_command_is_not_an_expired_session(
+    session: aiohttp.ClientSession, base_url: str, portal: Portal, answer: Any
+) -> None:
+    """
+    Gap 3: a valid but empty answer to a command does not mean "log in again".
+
+    Every falsy answer was treated as an expired session: clear the jar, log
+    in, and with a login less than 15 minutes old that is OtpThrottledError -
+    on a session that was fine. Only a redirect, a non-JSON answer, or an
+    empty answer while a check request is empty too, means expired.
+    """
+    api = make_api(session, base_url, Codes("654321"))
+    assert await api.make_requests([NetworkOverview()]) == OVERVIEW
+    cookie = api.session_cookie()
+    portal.action_answer = answer
+
+    assert await api.make_requests([STOP]) == ([] if answer is None else answer)
+    assert api.session_cookie() == cookie
     assert portal.logins == 1

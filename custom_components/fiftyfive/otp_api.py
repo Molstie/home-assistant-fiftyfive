@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Any
 
 from yarl import URL
 
-from fiftyfive import Api, CustomerType, Market
+from fiftyfive import Api, CustomerType, Market, NetworkOverview
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -52,6 +52,10 @@ SESSION_COOKIE = "PHPSESSID"
 # row. Every login can send a verification mail; never hammer the account.
 MIN_LOGIN_INTERVAL = 15 * 60
 MAX_STRIKES = 3
+
+# What ``_request`` returns for a redirect or a non-JSON answer: the session
+# is not valid. Distinct from ``None``, which is a valid JSON ``null``.
+_EXPIRED = object()
 
 _TOKEN_RES = (
     re.compile(r"""name=["']_token["'][^>]*?value=["']([^"']+)["']""", re.IGNORECASE),
@@ -155,6 +159,12 @@ class LoginGuard:
             self.on_change()
 
 
+def _retrieve_exception(task: asyncio.Task[None]) -> None:
+    """Mark a failed login as seen, also when every waiter was cancelled."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _path(location: str) -> str:
     """Return the lower case path of a (possibly relative) redirect target."""
     return URL(location).path.lower() if location else ""
@@ -214,8 +224,11 @@ class OtpApi(Api):
         self._code_provider = code_provider
         self._on_login = on_login
         self._trace = trace
+        # One login at a time. The lock guards starting it; the task is what
+        # callers that arrive during a login wait for, so they all get its
+        # outcome (4 Oct 2026, see login()).
         self._lock = asyncio.Lock()
-        self._generation = 0
+        self._login_task: asyncio.Task[None] | None = None
 
     # -- session cookie -----------------------------------------------------
 
@@ -249,15 +262,30 @@ class OtpApi(Api):
     # -- login --------------------------------------------------------------
 
     async def login(self) -> bool:
-        """Log in, including the 2FA step when the portal asks for it."""
-        generation = self._generation
+        """
+        Log in, including the 2FA step when the portal asks for it.
+
+        At most one login runs at a time. A caller that arrives while one is
+        running does not start its own: it waits for the running one and gets
+        the same outcome, success or the same exception. Before, a waiter
+        started its own login after a failed one, the guard refused it, and
+        the waiter reported OtpThrottledError instead of the real cause.
+
+        The login itself runs as a shielded task, so a caller that is
+        cancelled (a service call timing out) does not abort it for the
+        others.
+        """
         async with self._lock:
-            # Another caller logged in while we were waiting for the lock.
-            if generation != self._generation and self.session_cookie():
-                return True
-            await self._login()
-            self._generation += 1
-            return True
+            task = self._login_task
+            if task is None or task.done():
+                task = asyncio.create_task(self._login())
+                task.add_done_callback(_retrieve_exception)
+                self._login_task = task
+        await asyncio.shield(task)
+        return True
+
+    def _login_running(self) -> bool:
+        return self._login_task is not None and not self._login_task.done()
 
     async def _login(self) -> None:
         now = time.time()
@@ -374,20 +402,63 @@ class OtpApi(Api):
     # -- requests -----------------------------------------------------------
 
     async def make_requests(self, requests: list[Request]) -> Any:
-        """Make requests; on an expired session log in once and retry once."""
-        if not self.session_cookie():
+        """
+        Make requests; on an expired session log in once and retry once.
+
+        Home Assistant calls this from several places at once: the coordinator
+        (every 5 s while the charger reports a session) next to services and
+        buttons. Three rules keep those callers from breaking each other's
+        session (4 Oct 2026):
+
+        - No request while a login is running: join the login instead. A
+          request with the fresh, not yet verified cookie only confuses the
+          portal and comes back "expired".
+        - Never clear the cookie jar here. Only the login clears it, and only
+          one login runs at a time. An "expired" answer for an older cookie
+          than the current one is retried on the current session, without a
+          login.
+        - An empty answer alone does not mean "expired": a command may answer
+          empty. Only a redirect or a non-JSON answer does, or an empty answer
+          while a check request on the same session is empty too.
+        """
+        if self._login_running() or not self.session_cookie():
             await self.login()
 
+        cookie = self.session_cookie()
         result = await self._request(requests)
-        if requests and not result:
+        if requests and await self._expired(result, cookie):
             _LOGGER.debug("50five session expired, logging in again")
-            self.clear_session()
-            await self.login()
+            await self._renew(cookie)
             result = await self._request(requests)
-        return result if result is not None else []
+        return [] if result is None or result is _EXPIRED else result
+
+    async def _expired(self, result: Any, cookie: str | None) -> bool:
+        """Return whether ``result``, answered for ``cookie``, means expired."""
+        if result is _EXPIRED:
+            return True
+        if result:
+            return False
+        if self._login_running() or self.session_cookie() != cookie:
+            # The answer belongs to a session that is being or has been
+            # replaced; the retry runs on the new one.
+            return True
+        check = await self._request([NetworkOverview()])
+        return check is _EXPIRED or not check
+
+    async def _renew(self, stale: str | None) -> None:
+        """
+        Get a working session after an expired answer for the cookie ``stale``.
+
+        Join a running login; use a session another caller set up while our
+        request was under way; only log in when the jar still holds ``stale``.
+        """
+        current = self.session_cookie()
+        if not self._login_running() and current and current != stale:
+            return
+        await self.login()
 
     async def _request(self, requests: list[Request]) -> Any:
-        """Return the decoded answer, or ``None`` when the session is not valid."""
+        """Return the decoded answer, or ``_EXPIRED`` when the portal redirects."""
         params = {"requests": dumps(dict(enumerate([r.request for r in requests])))}
         # No redirects: an expired session is redirected to the (http://)
         # login page, which only tells us to log in again.
@@ -397,12 +468,12 @@ class OtpApi(Api):
             if response.status != HTTPStatus.OK:
                 location = response.headers.get("Location", "")
                 self._log("GET /api/ajax", response.status, location)
-                return None
+                return _EXPIRED
             try:
                 return await response.json(content_type=None)
             except ValueError:
                 self._log("GET /api/ajax", response.status, "not JSON")
-                return None
+                return _EXPIRED
 
     def _log(self, step: str, status: int, location: str, extra: str = "") -> None:
         """Log one HTTP step without query strings or secrets."""
