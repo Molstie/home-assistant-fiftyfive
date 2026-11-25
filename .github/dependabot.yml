@@ -1,20 +1,46 @@
-# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# Dependabot voor deze fork van Crazy-Duck/home-assistant-fiftyfive.
+# - pip: geen versie-updates. De pin `fiftyfive<1.0.0` (hotfix v0.10.0-otp.3, besluit Martin 22 nov 2026) is bewust;
+#   `fiftyfive` staat daarom expliciet op ignore. Security-updates blijven mogelijk.
+# - github-actions: wekelijks vrijdag 06:00 (Europe/Amsterdam), gegroepeerd, geen major-updates.
+# De upstream-regels voor `devcontainers` zijn vervallen (geen dependency-updates in de fork).
+# Opzet en besluit: Homelab/opdracht-dependabot-2026-11.md (25 nov 2026).
 version: 2
 updates:
-  - package-ecosystem: "devcontainers"
+  - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "friday"
+      time: "06:00"
+      timezone: "Europe/Amsterdam"
+    open-pull-requests-limit: 5
+    groups:
+      pip-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "fiftyfive"
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
-
-  - package-ecosystem: "pip"
-    directory: "/"
-    schedule:
-      interval: "daily"
+      interval: "weekly"
+      day: "friday"
+      time: "06:00"
+      timezone: "Europe/Amsterdam"
+    open-pull-requests-limit: 5
+    groups:
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
+      actions-minor-patch:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
     ignore:
-      # Dependabot should not update Home Assistant as that should match the homeassistant key in hacs.json
-      - dependency-name: "homeassistant"
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
