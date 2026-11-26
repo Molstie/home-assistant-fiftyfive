@@ -35,6 +35,7 @@ from .imap_otp import (
     ImapOtpError,
     check_mailbox,
 )
+from .otp_api import use_current_host
 from .session_store import FiftyfiveSessionStore
 
 
@@ -184,6 +185,7 @@ class FiftyfiveFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             market=market,
             customer_type=customer_type,
         )
+        use_current_host(client)
         return await client.make_requests([NetworkOverview()])
 
 

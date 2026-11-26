@@ -48,6 +48,18 @@ HTTP_FOUND = 302
 MAX_REDIRECTS = 5
 SESSION_COOKIE = "PHPSESSID"
 
+# On 26 Nov 2026 50five moved the portal from 50five-snl.evc-net.com to
+# 50five.evc-net.com; the old host answers everything with a 301 to the new
+# one. Start on the new host, and follow such a move once as a safety net, but
+# only to another host of the portal domain.
+PORTAL_URL = "https://50five.evc-net.com"
+PORTAL_DOMAIN = "evc-net.com"
+_MOVED_HOSTS = frozenset({"50five-snl.evc-net.com"})
+_MOVED_STATUSES = frozenset(
+    {HTTPStatus.MOVED_PERMANENTLY, HTTPStatus.PERMANENT_REDIRECT}
+)
+_MOVE_SCHEME = "https"  # the new host is always used over https
+
 # At most one login per 15 minutes, and stop after three failed logins in a
 # row. Every login can send a verification mail; never hammer the account.
 MIN_LOGIN_INTERVAL = 15 * 60
@@ -180,6 +192,31 @@ def classify_location(location: str) -> LoginStep:
     return LoginStep.LOGGED_IN
 
 
+def use_current_host(api: Api) -> None:
+    """Point a library ``Api`` built for a moved portal host at the new one."""
+    if URL(api.url).host in _MOVED_HOSTS:
+        api.url = PORTAL_URL
+        api.api = f"{PORTAL_URL}/api/ajax"
+
+
+def _portal_host(host: str | None) -> bool:
+    """Return whether ``host`` belongs to the evc-net portal domain."""
+    return bool(host) and (host == PORTAL_DOMAIN or host.endswith(f".{PORTAL_DOMAIN}"))
+
+
+def _target(location: str) -> str:
+    """Return host and path of a redirect target, without the query string."""
+    url = URL(location) if location else None
+    if url is None:
+        return "no Location"
+    return f"{url.host}{url.path}" if url.is_absolute() else url.path
+
+
+def is_login_form(html: str) -> bool:
+    """Return whether a page is the login form (asking for the password)."""
+    return "passwordField" in _INPUT_NAME_RE.findall(html)
+
+
 def find_token(html: str) -> str | None:
     """Return the hidden CSRF ``_token`` of the 2FA form."""
     for pattern in _TOKEN_RES:
@@ -220,6 +257,7 @@ class OtpApi(Api):
             market=market,
             customer_type=customer_type,
         )
+        use_current_host(self)
         self.guard = guard
         self._code_provider = code_provider
         self._on_login = on_login
@@ -304,23 +342,45 @@ class OtpApi(Api):
 
     async def _login_steps(self, started: datetime) -> None:
         self.clear_session()
-        login_url = f"{self.url}/Login/Login"
         # Open the login page first, like a browser does. That sets the session
         # cookie and the load balancer cookie (SERVERID) the whole flow must
         # stick to; without it later steps can land on another backend.
-        await self._hop("GET", login_url)
+        status, location, html = await self._hop("GET", f"{self.url}/Login/Login")
+        if status != HTTPStatus.OK:
+            msg = (
+                f"50five answered HTTP {status} to the login page "
+                f"({_target(location)}) instead of showing it"
+            )
+            raise OtpFlowError(msg)
+        inputs = sorted(set(_INPUT_NAME_RE.findall(html)))
+        self._trace_line(f"  login form: inputs={','.join(inputs)}")
 
+        # The GET may have moved us to another portal host: build the URL again.
+        login_url = f"{self.url}/Login/Login"
         data = {
             "emailField": self.email,
             "passwordField": self.password,
             "Login": "Log in",
         }
-        status, location, _ = await self._hop(
+        status, location, html = await self._hop(
             "POST", login_url, data=data, headers=self._form_headers(login_url)
         )
-        if status != HTTP_FOUND or classify_location(location) is LoginStep.REJECTED:
+        # Only a redirect back to the login page, or the login form shown
+        # again, means the password was rejected. Anything else (a move, a
+        # firewall, an overloaded portal) is a flow error that says what the
+        # portal did, not "wrong password" (26 Nov 2026: a 301 showed up as
+        # "rejected the e-mail address or password").
+        if (
+            status == HTTP_FOUND and classify_location(location) is LoginStep.REJECTED
+        ) or (status == HTTPStatus.OK and is_login_form(html)):
             msg = "50five rejected the e-mail address or password"
             raise OtpAuthError(msg)
+        if status != HTTP_FOUND:
+            msg = (
+                f"50five answered HTTP {status} to the login "
+                f"({_target(location)}) instead of a redirect"
+            )
+            raise OtpFlowError(msg)
 
         # Follow the redirects one by one, exactly where the portal sends us.
         for _ in range(MAX_REDIRECTS):
@@ -385,8 +445,15 @@ class OtpApi(Api):
     def _form_headers(self, referer: str) -> dict[str, str]:
         return {"Origin": self.url, "Referer": referer}
 
-    async def _hop(self, method: str, url: str, **kwargs: Any) -> tuple[int, str, str]:
-        """Do one request without following redirects; return status, Location, body."""
+    async def _hop(
+        self, method: str, url: str, *, moved: bool = False, **kwargs: Any
+    ) -> tuple[int, str, str]:
+        """
+        Do one request without following redirects; return status, Location, body.
+
+        A permanent move to another portal host is followed once: the base URL
+        is switched and the same request is repeated there.
+        """
         async with self.session.request(
             method, url, allow_redirects=False, **kwargs
         ) as response:
@@ -397,7 +464,43 @@ class OtpApi(Api):
         self._log(
             f"{method} {URL(url).path}", status, location, f"set-cookie={cookies}"
         )
+        if not moved and self._follow_move(status, location):
+            # Same path and query, and the same headers, on the new host.
+            if referer := kwargs.get("headers", {}).get("Referer"):
+                kwargs["headers"] = self._form_headers(self._on_base(referer))
+            return await self._hop(method, self._on_base(url), moved=True, **kwargs)
         return status, location, body
+
+    def _follow_move(self, status: int, location: str) -> bool:
+        """
+        Switch to another portal host after a permanent move to it.
+
+        Only a 301/308 to another ``*.evc-net.com`` host counts; a move to any
+        other domain is never followed.
+        """
+        if status not in _MOVED_STATUSES or not location:
+            return False
+        target = URL(location)
+        old = URL(self.url).host
+        if not target.is_absolute() or target.host == old:
+            return False
+        if not _portal_host(target.host):
+            return False
+        new = str(target.with_scheme(_MOVE_SCHEME).origin())
+        _LOGGER.warning(
+            "50five moved its portal from %s to %s; following it. Update the "
+            "integration if this keeps showing up after a restart",
+            old,
+            target.host,
+        )
+        self._trace_line(f"  moved: {old} -> {target.host}")
+        self.url = new
+        self.api = f"{new}/api/ajax"
+        return True
+
+    def _on_base(self, url: str) -> str:
+        """Return ``url`` with its path and query on the current base URL."""
+        return str(URL(self.url).join(URL(URL(url).path_qs)))
 
     # -- requests -----------------------------------------------------------
 
@@ -457,23 +560,32 @@ class OtpApi(Api):
             return
         await self.login()
 
-    async def _request(self, requests: list[Request]) -> Any:
-        """Return the decoded answer, or ``_EXPIRED`` when the portal redirects."""
+    async def _request(self, requests: list[Request], *, moved: bool = False) -> Any:
+        """
+        Return the decoded answer, or ``_EXPIRED`` when the portal redirects.
+
+        A permanent move to another portal host is followed once, like in
+        ``_hop``. The session cookie belongs to the old host, so the retry
+        usually comes back expired and the caller logs in on the new host.
+        """
         params = {"requests": dumps(dict(enumerate([r.request for r in requests])))}
         # No redirects: an expired session is redirected to the (http://)
         # login page, which only tells us to log in again.
         async with self.session.get(
             self.api, params=params, allow_redirects=False
         ) as response:
-            if response.status != HTTPStatus.OK:
-                location = response.headers.get("Location", "")
-                self._log("GET /api/ajax", response.status, location)
-                return _EXPIRED
-            try:
-                return await response.json(content_type=None)
-            except ValueError:
-                self._log("GET /api/ajax", response.status, "not JSON")
-                return _EXPIRED
+            status = response.status
+            location = response.headers.get("Location", "")
+            if status == HTTPStatus.OK:
+                try:
+                    return await response.json(content_type=None)
+                except ValueError:
+                    self._log("GET /api/ajax", status, "not JSON")
+                    return _EXPIRED
+        self._log("GET /api/ajax", status, location)
+        if not moved and self._follow_move(status, location):
+            return await self._request(requests, moved=True)
+        return _EXPIRED
 
     def _log(self, step: str, status: int, location: str, extra: str = "") -> None:
         """Log one HTTP step without query strings or secrets."""

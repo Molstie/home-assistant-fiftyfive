@@ -22,7 +22,12 @@ from fiftyfive import (
     UnlockConnector,
 )
 
-from .otp_api import OtpAuthError, OtpLockedError, OtpLoginError
+from .otp_api import (
+    OtpAuthError,
+    OtpLockedError,
+    OtpLoginError,
+    use_current_host,
+)
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
@@ -71,13 +76,16 @@ class FiftyfiveApiClient:
         ``api`` replaces the library client, e.g. with an ``OtpApi`` when a
         mailbox for the verification code is configured.
         """
-        self._api = api or Api(
-            session=session,
-            email=username,
-            password=password,
-            market=market,
-            customer_type=customer_type,
-        )
+        if api is None:
+            api = Api(
+                session=session,
+                email=username,
+                password=password,
+                market=market,
+                customer_type=customer_type,
+            )
+            use_current_host(api)
+        self._api = api
 
     async def _make_requests(self, requests: list[Request]) -> Any:
         """Make requests; translate 2FA login errors into client errors."""

@@ -12,5 +12,5 @@
   "requirements": [
     "fiftyfive>=0.6.0,<1.0.0"
   ],
-  "version": "0.10.0-otp.3"
+  "version": "0.10.0-otp.4"
 }

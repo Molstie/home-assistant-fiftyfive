@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from json import loads
 from typing import TYPE_CHECKING, Any
 
@@ -12,10 +14,12 @@ import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from fiftyfive import Channel, CustomerType, Market, NetworkOverview, Stop
+from fiftyfive import Api, Channel, CustomerType, Market, NetworkOverview, Stop
+from fiftyfive_fork import otp_api
 from fiftyfive_fork.otp_api import (
     MAX_STRIKES,
     MIN_LOGIN_INTERVAL,
+    PORTAL_URL,
     LoginGuard,
     LoginStep,
     OtpApi,
@@ -27,6 +31,8 @@ from fiftyfive_fork.otp_api import (
     OtpThrottledError,
     classify_location,
     find_token,
+    is_login_form,
+    use_current_host,
 )
 
 if TYPE_CHECKING:
@@ -209,8 +215,10 @@ async def base_url(portal: Portal) -> AsyncIterator[str]:
 @pytest.fixture
 async def session() -> AsyncIterator[aiohttp.ClientSession]:
     """Return a client session; unsafe=True allows cookies for 127.0.0.1."""
+    # IPv4 only: the move tests use ``localhost``, which may resolve to ::1.
     async with aiohttp.ClientSession(
-        cookie_jar=aiohttp.CookieJar(unsafe=True)
+        cookie_jar=aiohttp.CookieJar(unsafe=True),
+        connector=aiohttp.TCPConnector(family=socket.AF_INET),
     ) as client:
         yield client
 
@@ -249,15 +257,15 @@ def test_classify_location() -> None:
 
 async def test_http_redirect_stays_on_https(session: aiohttp.ClientSession) -> None:
     """The portal redirects to http://; follow on https, path only (3 Oct 2026)."""
-    api = make_api(session, "https://50five-snl.evc-net.com", Codes())
+    api = make_api(session, "https://50five.evc-net.com", Codes())
 
     assert (
-        api._same_origin("http://50five-snl.evc-net.com/Overview")  # noqa: SLF001
-        == "https://50five-snl.evc-net.com/Overview"
+        api._same_origin("http://50five.evc-net.com/Overview")  # noqa: SLF001
+        == "https://50five.evc-net.com/Overview"
     )
     assert (
         api._same_origin("/2fa?x=1")  # noqa: SLF001
-        == "https://50five-snl.evc-net.com/2fa?x=1"
+        == "https://50five.evc-net.com/2fa?x=1"
     )
     with pytest.raises(OtpFlowError):
         api._same_origin("https://evil.example.com/2fa")  # noqa: SLF001
@@ -613,3 +621,233 @@ async def test_empty_answer_to_a_command_is_not_an_expired_session(
     assert await api.make_requests([STOP]) == ([] if answer is None else answer)
     assert api.session_cookie() == cookie
     assert portal.logins == 1
+
+
+# -- the portal move of 26 Nov 2026 -------------------------------------------
+
+LOGIN_FORM_HTML = """
+<form method="post" action="/Login/Login">
+  <input type="text" name="emailField">
+  <input type="password" name="passwordField">
+  <input type="submit" name="Login" value="Log in">
+</form>
+"""
+
+
+def test_starts_on_the_new_portal_host(session: aiohttp.ClientSession) -> None:
+    """The old host 50five-snl is replaced by 50five.evc-net.com (26 Nov 2026)."""
+    api = OtpApi(
+        session=session,
+        email="user@example.com",
+        password="secret",
+        market=Market.NL,
+        customer_type=CustomerType.FORMER_SHELL,
+        code_provider=Codes(),
+        guard=LoginGuard(),
+    )
+    assert api.url == PORTAL_URL == "https://50five.evc-net.com"
+    assert api.api == "https://50five.evc-net.com/api/ajax"
+
+    plain = Api(session, "user@example.com", "secret", Market.NL)
+    assert plain.url == "https://50five-snl.evc-net.com"
+    use_current_host(plain)
+    assert plain.api == "https://50five.evc-net.com/api/ajax"
+
+    other = Api(session, "u", "p", Market.DE, CustomerType.FIFTYFIVE)
+    before = other.url
+    use_current_host(other)
+    assert other.url == before  # only the known moved host is rewritten
+
+
+def test_is_login_form() -> None:
+    """The login form is recognised by its password field."""
+    assert is_login_form(LOGIN_FORM_HTML)
+    assert not is_login_form(TWO_FA_HTML)
+    assert not is_login_form("<html>overview</html>")
+
+
+@pytest.fixture
+def moved_portal(monkeypatch: pytest.MonkeyPatch, base_url: str) -> str:
+    """
+    Return the URL of an "old host" that 301s everything to the fake portal.
+
+    The fake portal runs on 127.0.0.1; the old host redirects to it as
+    ``http://localhost:<port>``, and ``localhost`` stands in for evc-net.com.
+    """
+    monkeypatch.setattr(otp_api, "PORTAL_DOMAIN", "localhost")
+    monkeypatch.setattr(otp_api, "_MOVE_SCHEME", "http")
+    return base_url.replace("127.0.0.1", "localhost")
+
+
+@pytest.fixture
+async def old_host(moved_portal: str) -> AsyncIterator[tuple[str, list[str]]]:
+    """Run the old host; return its URL and the paths it was asked for."""
+    asked: list[str] = []
+
+    async def moved(request: web.Request) -> web.Response:
+        asked.append(f"{request.method} {request.path}")
+        raise web.HTTPMovedPermanently(location=f"{moved_portal}{request.path_qs}")
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", moved)
+    async with TestServer(app) as server:
+        yield str(server.make_url("")).rstrip("/"), asked
+
+
+async def test_301_on_the_login_is_followed_once(
+    session: aiohttp.ClientSession,
+    portal: Portal,
+    moved_portal: str,
+    old_host: tuple[str, list[str]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 301 to another portal host: switch base URL, log in there (26 Nov 2026)."""
+    old_url, asked = old_host
+    portal.redirect_base = moved_portal
+    codes = Codes("654321")
+    trace: list[str] = []
+    api = make_api(session, old_url, codes)
+    api._trace = trace.append  # noqa: SLF001
+
+    assert await api.make_requests([NetworkOverview()]) == OVERVIEW
+
+    assert api.url == moved_portal
+    assert api.api == f"{moved_portal}/api/ajax"
+    assert asked == ["GET /Login/Login"]  # only the first request hit the old host
+    assert portal.logins == 1
+    assert len(codes.calls) == 1
+    assert api.guard.strikes == 0
+    assert "50five moved its portal" in caplog.text
+    assert any(line.startswith("  moved: 127.0.0.1 -> localhost") for line in trace)
+    assert trace[0].startswith("GET /Login/Login -> 301")
+
+
+async def test_301_on_api_ajax_is_followed_and_logs_in_on_the_new_host(
+    session: aiohttp.ClientSession,
+    portal: Portal,
+    moved_portal: str,
+    old_host: tuple[str, list[str]],
+) -> None:
+    """A saved session on the old host: the ajax 301 moves us, then one login."""
+    old_url, asked = old_host
+    portal.redirect_base = moved_portal
+    codes = Codes("654321")
+    api = make_api(session, old_url, codes)
+    api.restore_cookies({"PHPSESSID": "old-session", "SERVERID": "b1"})
+
+    assert await api.make_requests([NetworkOverview()]) == OVERVIEW
+
+    assert asked == ["GET /api/ajax"]
+    assert api.url == moved_portal
+    assert portal.logins == 1
+    assert api.guard.strikes == 0
+
+
+async def test_301_to_another_domain_is_not_followed(
+    session: aiohttp.ClientSession, portal: Portal
+) -> None:
+    """A move outside evc-net.com is never followed; it is a flow error."""
+
+    async def moved(_: web.Request) -> web.Response:
+        raise web.HTTPMovedPermanently(location="https://evil.example.com/Login/Login")
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", moved)
+    async with TestServer(app) as server:
+        url = str(server.make_url("")).rstrip("/")
+        codes = Codes("654321")
+        api = make_api(session, url, codes)
+
+        with pytest.raises(OtpFlowError, match="HTTP 301") as raised:
+            await api.login()
+
+    assert not isinstance(raised.value, OtpAuthError)
+    assert "evil.example.com/Login/Login" in str(raised.value)
+    assert api.url == url
+    assert codes.calls == []
+    assert portal.logins == 0
+    assert api.guard.strikes == 1
+
+
+@pytest.mark.parametrize("status", [301, 403, 429, 503])
+async def test_unexpected_answer_to_the_password_is_not_auth_error(
+    session: aiohttp.ClientSession, portal: Portal, status: int
+) -> None:
+    """Only a redirect to the login page means "wrong password" (26 Nov 2026)."""
+
+    async def odd(_: web.Request) -> web.Response:
+        portal.logins += 1
+        headers = {}
+        if status == HTTPStatus.MOVED_PERMANENTLY:
+            headers["Location"] = "https://evil.example.com/x"
+        return web.Response(status=status, headers=headers)
+
+    app = web.Application()
+    app.router.add_get("/Login/Login", portal.login_page)
+    app.router.add_post("/Login/Login", odd)
+    async with TestServer(app) as server:
+        api = make_api(session, str(server.make_url("")).rstrip("/"), Codes("1"))
+
+        with pytest.raises(OtpFlowError, match=f"HTTP {status} to the login") as raised:
+            await api.login()
+
+    assert not isinstance(raised.value, OtpAuthError)
+    assert portal.logins == 1
+    assert api.guard.strikes == 1  # strikes still count
+
+
+async def test_login_form_shown_again_is_auth_error(
+    session: aiohttp.ClientSession, portal: Portal
+) -> None:
+    """A 200 with the login form after the password is a real rejection."""
+
+    async def form_again(_: web.Request) -> web.Response:
+        return web.Response(text=LOGIN_FORM_HTML, content_type="text/html")
+
+    app = web.Application()
+    app.router.add_get("/Login/Login", portal.login_page)
+    app.router.add_post("/Login/Login", form_again)
+    async with TestServer(app) as server:
+        api = make_api(session, str(server.make_url("")).rstrip("/"), Codes("1"))
+
+        with pytest.raises(OtpAuthError):
+            await api.login()
+
+    assert api.guard.strikes == 1
+
+
+async def test_login_page_must_answer_200(
+    session: aiohttp.ClientSession, portal: Portal
+) -> None:
+    """The GET of the login page is checked: no password is sent after a 503."""
+
+    async def down(_: web.Request) -> web.Response:
+        return web.Response(status=503)
+
+    app = web.Application()
+    app.router.add_get("/Login/Login", down)
+    app.router.add_post("/Login/Login", portal.login)
+    async with TestServer(app) as server:
+        api = make_api(session, str(server.make_url("")).rstrip("/"), Codes("1"))
+
+        with pytest.raises(OtpFlowError, match="HTTP 503 to the login page"):
+            await api.login()
+
+    assert portal.logins == 0
+    assert api.guard.strikes == 1
+
+
+async def test_login_form_inputs_are_traced(
+    session: aiohttp.ClientSession, base_url: str, portal: Portal
+) -> None:
+    """The trace shows the GET and the names (not values) of the form fields."""
+    portal.two_factor = False
+    trace: list[str] = []
+    api = make_api(session, base_url, Codes())
+    api._trace = trace.append  # noqa: SLF001
+
+    await api.login()
+
+    assert trace[0].startswith("GET /Login/Login -> 200")
+    assert trace[1] == "  login form: inputs="
+    assert "secret" not in "".join(trace)
